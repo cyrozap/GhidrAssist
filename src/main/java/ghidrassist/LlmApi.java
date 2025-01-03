@@ -47,6 +47,56 @@ public class LlmApi {
     	return this.SYSTEM_PROMPT;
     }
     
+    public void sendSearchRequestAsync(String functionContext, String query, LlmResponseHandler responseHandler) {
+        if (service == null) {
+            Msg.showError(this, null, "Service Error", "OpenAI service is not initialized.");
+            return;
+        }
+
+        List<ChatMessage> messages = new ArrayList<>();
+        messages.add(new ChatMessage(ChatMessageRole.USER.value(), "```\n" + functionContext + "\n```\n\nAnalyze the function above."));
+        messages.add(new ChatMessage(ChatMessageRole.ASSISTANT.value(), "Ok."));
+        messages.add(new ChatMessage(ChatMessageRole.SYSTEM.value(), this.SYSTEM_PROMPT + "\n\n" +
+            "Given the pseudo-C code context provided by the user, determine whether it matches the criteria that the user will now provide.\n\n" +
+            //"Additionally, determine if the provided code context was truncated (i.e., the beginning of the code block was cut off and you know this because the code block is incomplete).\n\n" +
+            "Respond with a valid JSON object that has the following schema:\n" +
+            //"{\"match\": bool, \"context_truncated\": bool}\n\n" +
+            "{\"match\": bool}\n\n" +
+            "Do not output any text other than the JSON object. Do not place the JSON object inside a code block.\n"));
+        messages.add(new ChatMessage(ChatMessageRole.USER.value(), query));
+
+        // Build the ChatCompletionRequest with functions
+        ChatCompletionRequest chatCompletionRequest = ChatCompletionRequest.builder()
+                .model(this.provider.getModel())
+                .messages(messages)
+                .maxTokens(Integer.parseInt(this.provider.getMaxTokens()))
+                //.temperature(0.7)
+                .responseFormat(ChatResponseFormat.builder().type(ChatResponseFormat.ResponseFormat.JSON).build())
+                .build();
+
+        // Execute the request asynchronously
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                return service.createChatCompletion(chatCompletionRequest);
+            } catch (Exception e) {
+                throw new CompletionException(e);
+            }
+        }).thenAccept(chatCompletionResult -> {
+            if (!responseHandler.shouldContinue()) {  // Check if the process should continue after receiving the result
+                return;
+            }
+            if (chatCompletionResult != null && !chatCompletionResult.getChoices().isEmpty()) {
+                ChatMessage message = chatCompletionResult.getChoices().get(0).getMessage();
+                responseHandler.onComplete(message.getContent());
+            } else {
+                responseHandler.onError(new Exception("Empty response from LLM."));
+            }
+        }).exceptionally(throwable -> {
+            responseHandler.onError(throwable);
+            return null;
+        });
+    }
+
     public void sendRequestAsyncWithFunctions(String prompt, List<Map<String, Object>> functions, LlmResponseHandler responseHandler) {
         if (service == null) {
             Msg.showError(this, null, "Service Error", "OpenAI service is not initialized.");

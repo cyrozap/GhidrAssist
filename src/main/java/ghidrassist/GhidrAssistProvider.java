@@ -2,6 +2,7 @@ package ghidrassist;
 
 import docking.ComponentProvider;
 import ghidra.app.decompiler.*;
+import ghidra.app.services.GoToService;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressFactory;
 import ghidra.program.model.listing.*;
@@ -133,11 +134,13 @@ public class GhidrAssistProvider extends ComponentProvider {
         JPanel explainTab = createExplainTab();
         JPanel queryTab = createQueryTab();
         JPanel actionsTab = createActionsTab();
+        JPanel searchTab = createSearchTab();
         JPanel ragManagementTab = createRAGManagementTab();
 
         tabbedPane.addTab("Explain", explainTab);
         tabbedPane.addTab("Custom Query", queryTab);
         tabbedPane.addTab("Actions", actionsTab);
+        tabbedPane.addTab("Search", searchTab);
         tabbedPane.addTab("RAG Management", ragManagementTab);
 
         panel.add(tabbedPane, BorderLayout.CENTER);
@@ -345,6 +348,273 @@ public class GhidrAssistProvider extends ComponentProvider {
         actionsPanel.add(buttonPanel, BorderLayout.SOUTH);
 
         return actionsPanel;
+    }
+
+    private JPanel createSearchTab() {
+        JPanel searchPanel = new JPanel(new BorderLayout());
+
+        JTable resultsTable = new JTable();
+
+        // Create the table
+        DefaultTableModel tableModel = new DefaultTableModel(new Object[]{"Result", "Function", "Address"}, 0) {
+            private static final long serialVersionUID = 1L;
+
+            @Override
+            public Class<?> getColumnClass(int columnIndex) {
+                return String.class;
+            }
+
+            @Override
+            public boolean isCellEditable(int row, int column) {
+                return false; // Make the table uneditable
+            }
+        };
+        resultsTable.setModel(tableModel);
+        JScrollPane tableScrollPane = new JScrollPane(resultsTable);
+
+        resultsTable.addMouseListener(new java.awt.event.MouseAdapter() {
+            public void mouseClicked(java.awt.event.MouseEvent evt) {
+                int selectedRow = resultsTable.rowAtPoint(evt.getPoint());
+                if (selectedRow != -1) {
+                    String addressStr = tableModel.getValueAt(selectedRow, 2).toString(); // Get the address from the third column
+                    AddressFactory addressFactory = plugin.getCurrentProgram().getAddressFactory();
+                    Address addr = addressFactory.getAddress(addressStr);
+                    if (addr != null) {
+                        GoToService goToService = plugin.getTool().getService(GoToService.class);
+                        if (goToService != null) {
+                            // Jump to the function's address
+                            goToService.goTo(addr);
+                        }
+                    }
+                }
+            }
+        });
+
+        JTextArea searchTextArea = new JTextArea();
+        JScrollPane searchScrollPane = new JScrollPane(searchTextArea);
+        searchTextArea.setRows(2);
+
+        JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tableScrollPane, searchScrollPane);
+        splitPane.setResizeWeight(1);
+
+        JButton searchButton = new JButton("Search");
+        JButton clearButton = new JButton("Clear");
+
+        JPanel buttonPanel = new JPanel();
+        buttonPanel.add(searchButton);
+        buttonPanel.add(clearButton);
+
+        searchPanel.add(splitPane, BorderLayout.CENTER);
+        searchPanel.add(buttonPanel, BorderLayout.SOUTH);
+
+        // Add action listeners
+        searchButton.addActionListener(e -> {
+            if (isQueryRunning.get()) {
+                // If the query is running, stop it
+                isQueryRunning.set(false);
+                return;
+            }
+            else {
+                // Clear search results.
+                int rowCount = tableModel.getRowCount();
+                // Remove rows from the end to the beginning to avoid index shifting issues
+                for (int i = rowCount - 1; i >= 0; i--) {
+                    tableModel.removeRow(i);
+                }
+
+                // Set the button to "Stop" and set the query as running
+                searchButton.setText("Stop");
+                isQueryRunning.set(true);
+            }
+
+            Task task = new Task("Search Functions", true, true, true) {
+                @Override
+                public void run(TaskMonitor monitor) {
+                    try {
+                        Program currentProgram = plugin.getCurrentProgram();
+
+                        String searchQuery = searchTextArea.getText();
+
+                        // Create decompiler
+                        DecompileOptions options = new DecompileOptions();
+                        options.setDefaultTimeout(60); // seconds
+                        DecompInterface decompiler = new DecompInterface();
+                        decompiler.setOptions(options);
+                        decompiler.openProgram(currentProgram);
+
+                        // Use LlmApi to send request
+                        LlmApi llmApi = new LlmApi(GhidrAssistPlugin.getCurrentAPIProvider());
+
+                        FunctionManager functionManager = currentProgram.getFunctionManager();
+                        FunctionIterator functions = functionManager.getFunctions(false);
+                        for (Function func : functions) {
+                            try {
+                                DecompileResults results = decompiler.decompileFunction(func, 60, monitor);
+                                if (results == null || !results.decompileCompleted()) {
+                                    // Note in the table that this function failed to be decompiled.
+                                    Object[] rowData = new Object[]{
+                                        "Failed to decompile function",
+                                        func.getName(),
+                                        func.getEntryPoint().toString(),
+                                    };
+                                    tableModel.addRow(rowData);
+                                    return;
+                                }
+
+                                String decompiledCode = results.getDecompiledFunction().getC();
+
+                                numRunners.getAndIncrement();
+                                llmApi.sendSearchRequestAsync(decompiledCode, searchQuery, new LlmApi.LlmResponseHandler() {
+                                    @Override
+                                    public void onStart() {
+                                        // No need to clear the results here; already done
+                                    }
+
+                                    @Override
+                                    public void onUpdate(String partialResponse) {
+                                        // No streaming in search
+                                    }
+
+                                    @Override
+                                    public void onComplete(String fullResponse) {
+                                        SwingUtilities.invokeLater(() -> {
+                                            // Parse the response and populate the table
+                                            try {
+                                                Gson gson = new Gson();
+
+                                                //String responseJson = preprocessJsonResponse(fullResponse);
+
+                                                // Create a JsonReader with lenient mode enabled
+                                                JsonReader jsonReader = new JsonReader(new StringReader(fullResponse));
+                                                jsonReader.setLenient(true);
+
+                                                JsonElement jsonElement = gson.fromJson(jsonReader, JsonElement.class);
+
+                                                if (!jsonElement.isJsonObject()) {
+                                                    // TODO: Note in the table that the LLM response was invalid.
+                                                    Object[] rowData = new Object[]{
+                                                        "LLM response invalid: Unexpected JSON structure",
+                                                        func.getName(),
+                                                        func.getEntryPoint().toString(),
+                                                    };
+                                                    tableModel.addRow(rowData);
+                                                    return;
+                                                }
+
+                                                JsonObject jsonObject = jsonElement.getAsJsonObject();
+
+                                                //List<String> keys = List.of("match", "context_truncated");
+                                                List<String> keys = List.of("match", "match");
+                                                for (String key : keys) {
+                                                    if (!jsonObject.has(key)) {
+                                                        // Note in the table that the LLM response was invalid.
+                                                        Object[] rowData = new Object[]{
+                                                            "LLM response invalid: Response does not contain \"" + key + "\" field",
+                                                            func.getName(),
+                                                            func.getEntryPoint().toString(),
+                                                        };
+                                                        tableModel.addRow(rowData);
+                                                        return;
+                                                    }
+                                                }
+
+                                                boolean isMatch = jsonObject.get("match").getAsBoolean();
+                                                boolean isContextTruncated = false;//jsonObject.get("context_truncated").getAsBoolean();
+
+                                                if (!isMatch && !isContextTruncated) {
+                                                    // Ignore functions that don't match the search.
+                                                    return;
+                                                }
+
+                                                String result = "";
+                                                if (isMatch) {
+                                                    result = "Match";
+                                                }
+                                                if (isContextTruncated) {
+                                                    result = "Context Truncated";
+                                                }
+
+                                                Object[] rowData = new Object[]{
+                                                    result,
+                                                    func.getName(),
+                                                    func.getEntryPoint().toString(),
+                                                };
+                                                tableModel.addRow(rowData);
+                                            } catch (JsonSyntaxException e) {
+                                                Object[] rowData = new Object[]{
+                                                    "LLM response invalid: " + e.getMessage(),
+                                                    func.getName(),
+                                                    func.getEntryPoint().toString(),
+                                                };
+                                                tableModel.addRow(rowData);
+                                            }
+
+                                            numRunners.decrementAndGet();
+
+                                            if (numRunners.get() <= 0) {
+                                                numRunners.set(0);
+                                                // After all actions, reset the button text and stop the query
+                                                searchButton.setText("Search");
+                                                isQueryRunning.set(false);
+                                            }
+                                        });
+                                    }
+
+                                    @Override
+                                    public void onError(Throwable error) {
+                                        SwingUtilities.invokeLater(() -> {
+                                            // Reset the button text and stop the query
+                                            searchButton.setText("Search");
+                                            numRunners.decrementAndGet();
+
+                                            if (numRunners.get() <= 0) {
+                                                numRunners.set(0);
+                                                // After all actions, reset the button text and stop the query
+                                                searchButton.setText("Search");
+                                                isQueryRunning.set(false);
+                                            }
+
+                                            error.printStackTrace();
+                                            Msg.showError(this, panel, "Error", "An error occurred: " + error.getMessage());
+                                        });
+                                    }
+
+                                    @Override
+                                    public boolean shouldContinue() {
+                                        return isQueryRunning.get();  // Only continue if query is running
+                                    }
+                                });
+                            } catch (Exception e) {
+                                // Note in the table that this function failed to be decompiled
+                                Object[] rowData = new Object[]{
+                                    "Failed to decompile function: " + e.getMessage(),
+                                    func.getName(),
+                                    func.getEntryPoint().toString(),
+                                };
+                                tableModel.addRow(rowData);
+                            }
+                        }
+
+                        decompiler.dispose();
+                    } catch (Exception e) {
+                        Msg.showError(getClass(), panel, "Error", "Failed to search functions: " + e.getMessage());
+                    }
+                }
+            };
+
+            new TaskLauncher(task, plugin.getTool().getToolFrame());
+        });
+        clearButton.addActionListener(e -> {
+            // Clear search results.
+            int rowCount = tableModel.getRowCount();
+            // Remove rows from the end to the beginning to avoid index shifting issues
+            for (int i = rowCount - 1; i >= 0; i--) {
+                tableModel.removeRow(i);
+            }
+            searchTextArea.setText("");
+        });
+
+        return searchPanel;
     }
 
     private JPanel createRAGManagementTab() {
